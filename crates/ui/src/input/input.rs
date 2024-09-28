@@ -991,42 +991,6 @@ impl Element for TextElement {
             (text, cx.theme().foreground)
         };
 
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
-            vec![
-                TextRun {
-                    len: marked_range.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: marked_range.end - marked_range.start,
-                    underline: Some(UnderlineStyle {
-                        color: Some(run.color),
-                        thickness: px(1.0),
-                        wavy: false,
-                    }),
-                    ..run.clone()
-                },
-                TextRun {
-                    len: display_text.len() - marked_range.end,
-                    ..run.clone()
-                },
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect()
-        } else {
-            vec![run]
-        };
-
         let font_size = style.font_size.to_pixels(cx.rem_size());
         // Calculate the scroll offset to keep the cursor in view
         let mut scroll_offset = input.scroll_offset;
@@ -1036,6 +1000,38 @@ impl Element for TextElement {
         let mut last_layout = LastLayout { lines: vec![] };
 
         for line_text in display_text.split("\n") {
+            let run = TextRun {
+                len: line_text.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+
+            let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+                vec![
+                    TextRun {
+                        len: marked_range.start,
+                        ..run.clone()
+                    },
+                    TextRun {
+                        len: marked_range.end - marked_range.start,
+                        underline: Some(UnderlineStyle {
+                            color: Some(run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..run.clone()
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            } else {
+                vec![run]
+            };
+
             let line = cx
                 .text_system()
                 .shape_line(SharedString::from(line_text.to_string()), font_size, &runs)
@@ -1136,8 +1132,17 @@ impl Element for TextElement {
 
         let last_layout = prepaint.last_layout.take();
         if let Some(last_layout) = last_layout {
-            for line in last_layout.lines.iter() {
-                line.paint(bounds.origin, cx.line_height(), cx).unwrap();
+            for (i, line) in last_layout.lines.iter().enumerate() {
+                let y = bounds.origin.y + i as f32 * cx.line_height();
+                line.paint(
+                    Point {
+                        x: bounds.origin.x,
+                        y,
+                    },
+                    cx.line_height(),
+                    cx,
+                )
+                .unwrap();
             }
         }
 
