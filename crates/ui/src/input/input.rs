@@ -109,9 +109,25 @@ pub fn init(cx: &mut AppContext) {
     ]);
 }
 
+pub enum InputMode {
+    SingleLine,
+    MultiLine,
+}
+
+impl InputMode {
+    fn is_single_line(&self) -> bool {
+        matches!(self, Self::SingleLine)
+    }
+
+    fn is_multi_line(&self) -> bool {
+        matches!(self, Self::MultiLine)
+    }
+}
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     text: SharedString,
+    mode: InputMode,
     history: History<Change>,
     blink_cursor: Model<BlinkCursor>,
     prefix: Option<Box<dyn Fn(&mut ViewContext<Self>) -> AnyElement + 'static>>,
@@ -121,7 +137,7 @@ pub struct TextInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
+    last_layout: Option<LastLayout>,
     last_bounds: Option<Bounds<Pixels>>,
     scroll_offset: Point<Pixels>,
     is_selecting: bool,
@@ -144,6 +160,7 @@ impl TextInput {
         let input = Self {
             focus_handle: focus_handle.clone(),
             text: "".into(),
+            mode: InputMode::SingleLine,
             blink_cursor,
             history,
             placeholder: "".into(),
@@ -185,6 +202,12 @@ impl TextInput {
         cx.on_focus(&focus_handle, Self::on_focus).detach();
         cx.on_blur(&focus_handle, Self::on_blur).detach();
 
+        input
+    }
+
+    pub fn multi_line(cx: &mut ViewContext<Self>) -> Self {
+        let mut input = Self::new(cx);
+        input.mode = InputMode::MultiLine;
         input
     }
 
@@ -435,7 +458,10 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, cx: &mut ViewContext<Self>) {
         if let Some(clipboard) = cx.read_from_clipboard() {
-            let new_text = clipboard.text().unwrap_or_default().replace('\n', "");
+            let mut new_text = clipboard.text().unwrap_or_default();
+            if self.mode.is_single_line() {
+                new_text = new_text.replace('\n', "");
+            }
             self.replace_text_in_range(None, &new_text, cx);
         }
     }
@@ -511,7 +537,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.text.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.index_for_x(position.x - bounds.left()).unwrap_or(0)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut ViewContext<Self>) {
@@ -858,9 +884,50 @@ impl TextElement {
         });
     }
 }
+
+struct LastLayout {
+    lines: Vec<ShapedLine>,
+}
+
+impl LastLayout {
+    fn x_for_index(&self, index: usize) -> Pixels {
+        let mut x = px(0.);
+        let mut start_index = 0;
+        for line in &self.lines {
+            let end_index = start_index + line.len;
+            if index < end_index {
+                return x + line.x_for_index(index);
+            }
+            x += line.width;
+            start_index = end_index;
+        }
+
+        x
+    }
+
+    fn index_for_x(&self, x: Pixels) -> Option<usize> {
+        let mut start_x = px(0.);
+        let mut index = 0;
+        for line in &self.lines {
+            let end_x = x + line.width;
+            if x < end_x {
+                return Some(index + line.index_for_x(x - start_x)?);
+            }
+            start_x = end_x;
+            index += line.len;
+        }
+
+        None
+    }
+
+    fn len(&self) -> usize {
+        self.lines.iter().map(|line| line.len).sum()
+    }
+}
+
 struct PrepaintState {
     scroll_offset: Point<Pixels>,
-    line: Option<ShapedLine>,
+    last_layout: Option<LastLayout>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
     bounds: Bounds<Pixels>,
@@ -887,9 +954,15 @@ impl Element for TextElement {
         _id: Option<&GlobalElementId>,
         cx: &mut WindowContext,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let is_multi_line = self.input.read(cx).mode.is_multi_line();
+
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = cx.line_height().into();
+        if is_multi_line {
+            style.size.height = relative(1.).into();
+        } else {
+            style.size.height = cx.line_height().into();
+        }
         (cx.request_layout(style, []), ())
     }
 
@@ -904,7 +977,7 @@ impl Element for TextElement {
         let text = input.text.clone();
         let placeholder = input.placeholder.clone();
         let selected_range = input.selected_range.clone();
-        let cursor = input.cursor_offset();
+        let cursor_offset = input.cursor_offset();
         let style = cx.text_style();
 
         let (display_text, text_color) = if text.is_empty() {
@@ -955,18 +1028,25 @@ impl Element for TextElement {
         };
 
         let font_size = style.font_size.to_pixels(cx.rem_size());
-        let line = cx
-            .text_system()
-            .shape_line(display_text, font_size, &runs)
-            .unwrap();
-
         // Calculate the scroll offset to keep the cursor in view
         let mut scroll_offset = input.scroll_offset;
         let mut bounds = bounds;
         let right_margin = px(5.);
-        let cursor_pos = line.x_for_index(cursor);
-        let cursor_start = line.x_for_index(selected_range.start);
-        let cursor_end = line.x_for_index(selected_range.end);
+
+        let mut last_layout = LastLayout { lines: vec![] };
+
+        for line_text in display_text.split("\n") {
+            let line = cx
+                .text_system()
+                .shape_line(SharedString::from(line_text.to_string()), font_size, &runs)
+                .unwrap();
+
+            last_layout.lines.push(line);
+        }
+
+        let cursor_pos = last_layout.x_for_index(cursor_offset);
+        let cursor_start = last_layout.x_for_index(selected_range.start);
+        let cursor_end = last_layout.x_for_index(selected_range.end);
 
         scroll_offset.x = if scroll_offset.x + cursor_pos > (bounds.size.width - right_margin) {
             // cursor is out of right
@@ -1011,11 +1091,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.left() + last_layout.x_for_index(selected_range.start),
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.left() + last_layout.x_for_index(selected_range.end),
                             bounds.bottom(),
                         ),
                     ),
@@ -1028,7 +1108,7 @@ impl Element for TextElement {
         PrepaintState {
             scroll_offset,
             bounds,
-            line: Some(line),
+            last_layout: Some(last_layout),
             cursor,
             selection,
         }
@@ -1053,8 +1133,13 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             cx.paint_quad(selection)
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, cx.line_height(), cx).unwrap();
+
+        let last_layout = prepaint.last_layout.take();
+        if let Some(last_layout) = last_layout {
+            for line in last_layout.lines.iter() {
+                line.paint(bounds.origin, cx.line_height(), cx).unwrap();
+            }
+        }
 
         if focused {
             if let Some(cursor) = prepaint.cursor.take() {
@@ -1063,7 +1148,7 @@ impl Element for TextElement {
         }
         self.input.update(cx, |input, _cx| {
             input.scroll_offset = prepaint.scroll_offset;
-            input.last_layout = Some(line);
+            input.last_layout = None;
             input.last_bounds = Some(bounds);
         });
 
@@ -1116,7 +1201,10 @@ impl Render for TextInput {
             .line_height(rems(1.25))
             .text_size(rems(0.875))
             .input_py(self.size)
-            .input_h(self.size)
+            .when(self.mode.is_multi_line(), |this| this.items_start())
+            .when(self.mode.is_single_line(), |this| {
+                this.input_h(self.size).items_center()
+            })
             .when(self.appearance, |this| {
                 this.bg(if self.disabled {
                     cx.theme().muted
@@ -1133,12 +1221,11 @@ impl Render for TextInput {
             })
             .children(prefix)
             .gap_1()
-            .items_center()
             .child(
                 div()
                     .id("TextElement")
                     .flex_grow()
-                    .overflow_x_hidden()
+                    .when(self.mode.is_single_line(), |this| this.overflow_x_hidden())
                     .cursor_text()
                     .child(TextElement {
                         input: cx.view().clone(),

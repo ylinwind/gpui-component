@@ -79,7 +79,7 @@ impl InputStory {
 
         cx.subscribe(&input1, Self::on_input_event).detach();
 
-        let input2 = cx.new_view(|cx| TextInput::new(cx).placeholder("Enter text here..."));
+        let input2 = cx.new_view(|cx| TextInput::multi_line(cx).placeholder("Enter text here..."));
 
         cx.subscribe(&input2, Self::on_input_event).detach();
 
